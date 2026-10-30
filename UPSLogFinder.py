@@ -40,6 +40,7 @@ class EventLogEntry:
     timestamp: datetime
     alarm_code: str
     message: str
+    severity: str = ""  # C/W/I, set by UPSLogCore once the alarm code is decoded
 
 
 def get_ups_logs_dir(sdx: str, base_path: Path = BASE_LOG_PATH) -> Path:
@@ -76,7 +77,7 @@ def list_log_files(directory: Path) -> List[Path]:
 def parse_datalog_file(path: Path, sdx: str) -> List[DataLogEntry]:
     """Parse a datalog fileXX.csv: datetime,inV,outV,inHz,outHz,load%,tempC,backupMin,battV,batt%."""
     entries: List[DataLogEntry] = []
-    with path.open(newline="", encoding="utf-8", errors="replace") as f:
+    with path.open("r", newline="", encoding="utf-8", errors="replace") as f:
         for row in csv.reader(f):
             if len(row) < 10:
                 continue
@@ -104,7 +105,7 @@ def parse_datalog_file(path: Path, sdx: str) -> List[DataLogEntry]:
 def parse_eventlog_file(path: Path, sdx: str) -> List[EventLogEntry]:
     """Parse an eventlog fileXX.csv: 'YYYY/MM/DD HH:MM:SS alarmCode embedded text'."""
     entries: List[EventLogEntry] = []
-    with path.open(encoding="utf-8", errors="replace") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
