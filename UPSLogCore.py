@@ -21,6 +21,11 @@ NOMINAL_FREQUENCY_HZ = 60.0
 # Both the summary and the rolling graph only look at the trailing 7 days of datalog samples.
 DATALOG_ANALYSIS_WINDOW = timedelta(days=7)
 
+# Weekly scheduled UPS test: Monday 20:00, +/-10 minutes.
+SCHEDULED_TEST_WEEKDAY = 0
+SCHEDULED_TEST_HOUR = 20
+SCHEDULED_TEST_TOLERANCE = timedelta(minutes=10)
+
 DATALOG_METRIC_COLUMNS = [
     "input_voltage",
     "output_voltage",
@@ -58,6 +63,7 @@ class DatalogSummary:
     battery_voltage_min: float
     battery_level_net_delta_pct: float
     battery_level_max_discharge_rate_pct_per_hr: float
+    battery_level_min_scheduled_test_pct: Optional[float] = None
 
 
 @dataclass
@@ -77,6 +83,11 @@ def decode_eventlog_entries(eventlog_entries: List["EventLogEntry"]) -> List["Ev
         entry.severity = eventLogCoding.classify_alarm_severity(entry.alarm_code)
         entry.alarm_code = eventLogCoding.decode_alarm_code(entry.alarm_code)
     return eventlog_entries
+
+
+def clear_output() -> None:
+    """Clear prior output files before a run, so a toolset that no longer produces a report leaves none behind."""
+    UPSLogToCsv.clear_output_dir()
 
 
 def _datalog_frame(datalog_entries: List["DataLogEntry"], window: timedelta = DATALOG_ANALYSIS_WINDOW) -> pd.DataFrame:
@@ -108,6 +119,15 @@ def _max_discharge_rate_pct_per_hr(df: pd.DataFrame) -> float:
     rates = (drop_pct / hours).replace([float("inf"), float("-inf")], pd.NA).dropna()
     positive_rates = rates[rates > 0]
     return float(positive_rates.max()) if not positive_rates.empty else 0.0
+
+
+def _battery_level_min_scheduled_test(df: pd.DataFrame) -> Optional[float]:
+    """Lowest battery level within +/-10 minutes of the weekly Monday 20:00 scheduled test."""
+    ts = df["timestamp"]
+    test_time = ts.dt.normalize() + pd.Timedelta(hours=SCHEDULED_TEST_HOUR)
+    in_test_window = (ts.dt.weekday == SCHEDULED_TEST_WEEKDAY) & ((ts - test_time).abs() <= SCHEDULED_TEST_TOLERANCE)
+    levels = df.loc[in_test_window, "battery_level"]
+    return float(levels.min()) if not levels.empty else None
 
 
 def summarize_datalog(
@@ -148,6 +168,7 @@ def summarize_datalog(
         battery_voltage_min=float(df["battery_voltage"].min()),
         battery_level_net_delta_pct=float(df["battery_level"].iloc[-1] - df["battery_level"].iloc[0]),
         battery_level_max_discharge_rate_pct_per_hr=_max_discharge_rate_pct_per_hr(df),
+        battery_level_min_scheduled_test_pct=_battery_level_min_scheduled_test(df),
     )
 
 

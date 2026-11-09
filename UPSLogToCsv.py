@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import shutil
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,6 +18,16 @@ if TYPE_CHECKING:
     from UPSLogCore import DatalogSummary, SdxAnalysis
 
 OUTPUT_DIR = Path("output")
+
+
+def clear_output_dir(output_dir: Path = OUTPUT_DIR) -> None:
+    """Remove any existing output files so a toolset missing this run doesn't leave stale reports behind."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in output_dir.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 EVENTLOG_FIELDS = [
     "timestamp",
@@ -79,6 +90,7 @@ DATALOG_SUMMARY_FIELDS = [
     "battery_voltage_min",
     "battery_level_net_delta_pct",
     "battery_level_max_discharge_rate_pct_per_hr",
+    "battery_level_min_scheduled_test_pct",
 ]
 
 
@@ -110,10 +122,10 @@ ROLLING_GRAPH_PANELS = [
 def write_datalog_rolling_graph(sdx: str, rolling_24h: "pd.DataFrame", output_dir: Path = OUTPUT_DIR) -> Path:
     """Render the toolset's 24-hour rolling datalog summary as one figure with a panel per metric."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    graph_path = output_dir / f"{sdx}_datalog_rolling_24h.png"
+    graph_path = output_dir / f"{sdx}_datalog_rolling_7d.png"
 
     fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
-    fig.suptitle(f"{sdx} - 24 Hour Rolling Summary")
+    fig.suptitle(f"{sdx} - 7 day Rolling Summary")
 
     for ax, (title, series) in zip(axes.flat, ROLLING_GRAPH_PANELS):
         for column, label in series:

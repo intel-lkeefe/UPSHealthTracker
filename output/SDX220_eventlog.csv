@@ -1,0 +1,5 @@
+timestamp,severity,alarm_code,message
+2026-11-07 00:13:56,C,Battery Weak,"BU3002SW,USB 1"
+2026-11-07 00:13:56,W,Battery Disconnect,"BU3002SW,USB 1"
+2026-11-07 01:20:51,C,Battery Weak,"BU3002SW,USB 1"
+2026-11-07 01:20:51,W,Battery Disconnect,"BU3002SW,USB 1"

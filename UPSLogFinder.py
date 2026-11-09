@@ -153,6 +153,7 @@ def main() -> None:
         print(f"No SDX toolsets found under {args.base_path}")
         return
 
+    UPSLogCore.clear_output()
     for sdx in sdx_list:
         print(f"Processing {sdx}...")
         process_sdx(sdx, args.base_path)
