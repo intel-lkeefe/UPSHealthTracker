@@ -166,6 +166,10 @@ INFO_ALARMS: dict = {
 # form encodes the lookup key in the low 3 hex digits, e.g. 2147484672 -> 0x80000800 -> 0x800.
 ALARM_CODE_MASK = 0xFFF
 
+# Informational alarms that should still appear in reports despite being non-critical:
+# 0x004 "Self test: OK", 0x02F "'Self Test' executed" (raw codes 0004, 0047).
+INFO_ALARM_REPORT_EXCEPTIONS = {0x004, 0x02F}
+
 
 def decode_alarm_code(code: str | int) -> str:
     """Resolve a raw eventlog alarm code to its alarm description string."""
@@ -204,3 +208,12 @@ def classify_alarm_severity(code: str | int) -> str:
     if hex_code in INFO_ALARMS:
         return SEVERITY_INFO
     return SEVERITY_UNKNOWN
+
+
+def is_reportable_info_alarm(code: str | int) -> bool:
+    """True if an otherwise-informational alarm code is in the report-anyway exception list."""
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return False
+    return (value & ALARM_CODE_MASK) in INFO_ALARM_REPORT_EXCEPTIONS

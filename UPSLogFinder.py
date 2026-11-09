@@ -6,7 +6,7 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import UPSLogCore
 
@@ -41,6 +41,7 @@ class EventLogEntry:
     alarm_code: str
     message: str
     severity: str = ""  # C/W/I, set by UPSLogCore once the alarm code is decoded
+    always_include: bool = False  # set by UPSLogCore for info alarms reportable despite being non-critical
 
 
 def get_ups_logs_dir(sdx: str, base_path: Path = BASE_LOG_PATH) -> Path:
@@ -136,7 +137,7 @@ def gather_sdx_logs(sdx: str, base_path: Path = BASE_LOG_PATH) -> Tuple[List[Dat
     return datalog_entries, eventlog_entries
 
 
-def process_sdx(sdx: str, base_path: Path = BASE_LOG_PATH) -> UPSLogCore.SdxAnalysis:
+def process_sdx(sdx: str, base_path: Path = BASE_LOG_PATH) -> Optional[UPSLogCore.SdxAnalysis]:
     """Parse logs for one toolset and hand the data off to UPSLogCore for analysis."""
     datalog_entries, eventlog_entries = gather_sdx_logs(sdx, base_path)
     return UPSLogCore.analyze_sdx_logs(sdx, datalog_entries, eventlog_entries)
@@ -154,9 +155,15 @@ def main() -> None:
         return
 
     UPSLogCore.clear_output()
+    analyses: List[UPSLogCore.SdxAnalysis] = []
     for sdx in sdx_list:
         print(f"Processing {sdx}...")
-        process_sdx(sdx, args.base_path)
+        analysis = process_sdx(sdx, args.base_path)
+        if analysis is not None:
+            analyses.append(analysis)
+
+    report_path = UPSLogCore.write_html_report(analyses)
+    print(f"Wrote report to {report_path}")
 
 
 if __name__ == "__main__":

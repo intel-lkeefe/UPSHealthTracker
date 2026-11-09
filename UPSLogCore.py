@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
 import pandas as pd
@@ -77,10 +78,25 @@ class SdxAnalysis:
     eventlog_entries: List["EventLogEntry"] = field(default_factory=list)
 
 
+def _latest_timestamp(entries: List) -> Optional[datetime]:
+    return max((e.timestamp for e in entries), default=None)
+
+
+def _has_recent_activity(
+    datalog_entries: List["DataLogEntry"],
+    eventlog_entries: List["EventLogEntry"],
+    window: timedelta = DATALOG_ANALYSIS_WINDOW,
+) -> bool:
+    """True if the toolset's newest datalog or eventlog entry falls within the trailing `window` of now."""
+    latest = _latest_timestamp(datalog_entries + eventlog_entries)
+    return latest is not None and latest >= datetime.now() - window
+
+
 def decode_eventlog_entries(eventlog_entries: List["EventLogEntry"]) -> List["EventLogEntry"]:
     """Set each entry's severity (C/W/I) and replace its raw numeric alarm code with its description."""
     for entry in eventlog_entries:
         entry.severity = eventLogCoding.classify_alarm_severity(entry.alarm_code)
+        entry.always_include = eventLogCoding.is_reportable_info_alarm(entry.alarm_code)
         entry.alarm_code = eventLogCoding.decode_alarm_code(entry.alarm_code)
     return eventlog_entries
 
@@ -188,11 +204,15 @@ def analyze_sdx_logs(
     sdx: str,
     datalog_entries: List["DataLogEntry"],
     eventlog_entries: List["EventLogEntry"],
-) -> SdxAnalysis:
-    """Compute summary health metrics for a toolset, then hand off for per-toolset CSV/graph output."""
+) -> Optional[SdxAnalysis]:
+    """Compute summary health metrics for a toolset, or return None if it has no recent activity."""
     decode_eventlog_entries(eventlog_entries)
 
-    analysis = SdxAnalysis(
+    if not _has_recent_activity(datalog_entries, eventlog_entries):
+        print(f"Skipping {sdx}: no datalog/eventlog activity in the past {DATALOG_ANALYSIS_WINDOW.days} days.")
+        return None
+
+    return SdxAnalysis(
         sdx=sdx,
         sample_count=len(datalog_entries),
         alarm_count=len(eventlog_entries),
@@ -202,9 +222,7 @@ def analyze_sdx_logs(
         eventlog_entries=eventlog_entries,
     )
 
-    UPSLogToCsv.write_eventlog_report(analysis)
-    if analysis.datalog_summary is not None:
-        UPSLogToCsv.write_datalog_summary(analysis.datalog_summary)
-    if analysis.datalog_rolling_24h is not None:
-        UPSLogToCsv.write_datalog_rolling_graph(sdx, analysis.datalog_rolling_24h)
-    return analysis
+
+def write_html_report(analyses: List[SdxAnalysis]) -> Path:
+    """Write every processed toolset's analysis into a single combined HTML report."""
+    return UPSLogToCsv.write_html_report(analyses)
