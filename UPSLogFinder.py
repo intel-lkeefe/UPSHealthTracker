@@ -42,6 +42,7 @@ class EventLogEntry:
     message: str
     severity: str = ""  # C/W/I, set by UPSLogCore once the alarm code is decoded
     always_include: bool = False  # set by UPSLogCore for info alarms reportable despite being non-critical
+    raw_code: str = ""  # original numeric alarm code, preserved after alarm_code is overwritten with its description
 
 
 def get_ups_logs_dir(sdx: str, base_path: Path = BASE_LOG_PATH) -> Path:
@@ -120,7 +121,9 @@ def parse_eventlog_file(path: Path, sdx: str) -> List[EventLogEntry]:
                 timestamp = datetime.strptime(f"{date_str} {time_str}", DATETIME_FORMAT)
             except ValueError:
                 continue
-            entries.append(EventLogEntry(sdx=sdx, timestamp=timestamp, alarm_code=alarm_code, message=message))
+            entries.append(
+                EventLogEntry(sdx=sdx, timestamp=timestamp, alarm_code=alarm_code, message=message, raw_code=alarm_code)
+            )
     return entries
 
 
@@ -164,6 +167,9 @@ def main() -> None:
 
     report_path = UPSLogCore.write_html_report(analyses)
     print(f"Wrote report to {report_path}")
+
+    eventlog_raw_path = UPSLogCore.write_eventlog_raw_csv(analyses)
+    print(f"Wrote raw eventlog to {eventlog_raw_path}")
 
 
 if __name__ == "__main__":

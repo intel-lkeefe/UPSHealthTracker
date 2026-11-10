@@ -1,0 +1,26 @@
+# Placeholder "golden" thresholds for key datalog health metrics - PLACEHOLDER VALUES, tune to your fleet's real specs.
+# green = healthy, yellow = slightly out of range, red = urgent attention needed.
+# Leave a bound blank for "no limit on that side". yellow bounds should be wider than green bounds.
+metric,green_min,green_max,yellow_min,yellow_max
+sample_count,9000,,5000,
+input_voltage_min,197.6,,187.2,
+input_voltage_max,,218.4,,228.8
+input_voltage_p1,197.6,,187.2,
+input_voltage_p99,,218.4,,228.8
+input_voltage_rms,197.6,218.4,187.2,228.8
+output_voltage_min,196,,190,
+output_voltage_max,,204,,210
+output_voltage_p1,196,,190,
+output_voltage_p99,,204,,210
+output_voltage_rms,196,204,190,210
+input_freq_max_deviation_hz,,0.5,,1.0
+output_freq_max_deviation_hz,,0.5,,1.0
+temp_max_c,,45,,50
+temp_time_above_threshold_min,,0,,15
+load_p95_pct,,75,,90
+load_time_in_overload_min,,0,,15
+battery_voltage_min,75,,65,
+battery_level_net_delta_pct,-5,,-20,
+min_discharged_value,50,,1,
+longest_deenergize_duration_min,,30,,90
+battery_level_min_scheduled_test_pct,20,,1,

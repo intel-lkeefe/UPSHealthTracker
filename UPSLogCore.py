@@ -1,10 +1,11 @@
 """Analyze parsed UPS log data for a toolset and forward results to UPSLogToCsv for output."""
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -22,10 +23,14 @@ NOMINAL_FREQUENCY_HZ = 60.0
 # Both the summary and the rolling graph only look at the trailing 7 days of datalog samples.
 DATALOG_ANALYSIS_WINDOW = timedelta(days=7)
 
-# Weekly scheduled UPS test: Monday 20:00, +/-10 minutes.
-SCHEDULED_TEST_WEEKDAY = 0
-SCHEDULED_TEST_HOUR = 20
-SCHEDULED_TEST_TOLERANCE = timedelta(minutes=10)
+# The eventlog table/raw CSV and self-test detection only look at this trailing window.
+EVENTLOG_ANALYSIS_WINDOW = timedelta(days=14)
+
+# Window around each detected self-test event (alarm code 47) used to sample battery level and shade graphs.
+SELF_TEST_WINDOW_TOLERANCE = timedelta(minutes=10)
+
+# Battery level considered "recovered"/de-energizing-event-over after a dip.
+BATTERY_RECOVERY_THRESHOLD_PCT = 95.0
 
 DATALOG_METRIC_COLUMNS = [
     "input_voltage",
@@ -37,6 +42,92 @@ DATALOG_METRIC_COLUMNS = [
     "battery_voltage",
     "battery_level",
 ]
+
+LIMITS_FILE = Path(__file__).parent / "UPSLogLimits.csv"
+
+
+@dataclass
+class MetricRange:
+    """Green/yellow bounds for one gauged metric; a bound of None means no limit on that side."""
+
+    green_min: Optional[float]
+    green_max: Optional[float]
+    yellow_min: Optional[float]
+    yellow_max: Optional[float]
+
+
+def _parse_bound(raw: str) -> Optional[float]:
+    raw = raw.strip()
+    return float(raw) if raw else None
+
+
+def load_metric_limits(path: Path = LIMITS_FILE) -> Dict[str, MetricRange]:
+    """Read the green/yellow bounds CSV, skipping blank lines and '#' comments."""
+    limits: Dict[str, MetricRange] = {}
+    if not path.is_file():
+        return limits
+
+    with path.open(newline="", encoding="utf-8") as f:
+        data_lines = [line for line in f if line.strip() and not line.lstrip().startswith("#")]
+    for row in csv.DictReader(data_lines):
+        metric = (row.get("metric") or "").strip()
+        if not metric:
+            continue
+        limits[metric] = MetricRange(
+            green_min=_parse_bound(row.get("green_min") or ""),
+            green_max=_parse_bound(row.get("green_max") or ""),
+            yellow_min=_parse_bound(row.get("yellow_min") or ""),
+            yellow_max=_parse_bound(row.get("yellow_max") or ""),
+        )
+    return limits
+
+
+# Loaded once at import time; edit UPSLogLimits.csv and restart to pick up changes.
+METRIC_LIMITS = load_metric_limits()
+
+
+def classify_metric(value: Optional[float], limits: Optional[MetricRange]) -> Optional[str]:
+    """Return 'green'/'yellow'/'red' for a gauged metric, or None if it isn't gauged."""
+    if value is None or limits is None:
+        return None
+
+    green_min = limits.green_min if limits.green_min is not None else float("-inf")
+    green_max = limits.green_max if limits.green_max is not None else float("inf")
+    if green_min <= value <= green_max:
+        return "green"
+
+    yellow_min = limits.yellow_min if limits.yellow_min is not None else float("-inf")
+    yellow_max = limits.yellow_max if limits.yellow_max is not None else float("inf")
+    if yellow_min <= value <= yellow_max:
+        return "yellow"
+
+    return "red"
+
+
+def compute_datalog_gauges(summary: Optional["DatalogSummary"]) -> Dict[str, str]:
+    """Classify each gauged field of a datalog summary as green/yellow/red per UPSLogLimits.csv."""
+    if summary is None:
+        return {}
+    gauges = {}
+    for metric, limits in METRIC_LIMITS.items():
+        color = classify_metric(getattr(summary, metric, None), limits)
+        if color is not None:
+            gauges[metric] = color
+
+    # The weekly self-test discharge is often the toolset's single lowest battery reading, so
+    # min_discharged_value frequently equals battery_level_min_scheduled_test_pct; when it does,
+    # gauge it with that metric's (usually stricter) thresholds instead of its own.
+    if (
+        summary.battery_level_min_scheduled_test_pct is not None
+        and summary.min_discharged_value == summary.battery_level_min_scheduled_test_pct
+    ):
+        test_color = classify_metric(
+            summary.min_discharged_value, METRIC_LIMITS.get("battery_level_min_scheduled_test_pct")
+        )
+        if test_color is not None:
+            gauges["min_discharged_value"] = test_color
+
+    return gauges
 
 
 @dataclass
@@ -63,7 +154,8 @@ class DatalogSummary:
     load_time_in_overload_min: float
     battery_voltage_min: float
     battery_level_net_delta_pct: float
-    battery_level_max_discharge_rate_pct_per_hr: float
+    min_discharged_value: float
+    longest_deenergize_duration_min: Optional[float] = None
     battery_level_min_scheduled_test_pct: Optional[float] = None
 
 
@@ -74,6 +166,11 @@ class SdxAnalysis:
     alarm_count: int
     datalog_summary: Optional[DatalogSummary] = None
     datalog_rolling_24h: Optional[pd.DataFrame] = None
+    datalog_gauges: Dict[str, str] = field(default_factory=dict)
+    scheduled_test_windows: List[Tuple[datetime, datetime]] = field(default_factory=list)
+    self_test_recovery_minutes: List[Tuple[datetime, Optional[float]]] = field(default_factory=list)
+    self_test_alert: Optional[str] = None
+    analysis_window_start: Optional[datetime] = None
     datalog_entries: List["DataLogEntry"] = field(default_factory=list)
     eventlog_entries: List["EventLogEntry"] = field(default_factory=list)
 
@@ -128,26 +225,69 @@ def _duration_above_threshold_min(df: pd.DataFrame, column: str, threshold: floa
     return float(minutes_to_next[above].sum())
 
 
-def _max_discharge_rate_pct_per_hr(df: pd.DataFrame) -> float:
-    """Largest drop in battery level per hour between consecutive samples."""
-    hours = df["timestamp"].diff().dt.total_seconds() / 3600.0
-    drop_pct = -df["battery_level"].diff()
-    rates = (drop_pct / hours).replace([float("inf"), float("-inf")], pd.NA).dropna()
-    positive_rates = rates[rates > 0]
-    return float(positive_rates.max()) if not positive_rates.empty else 0.0
-
-
-def _battery_level_min_scheduled_test(df: pd.DataFrame) -> Optional[float]:
-    """Lowest battery level within +/-10 minutes of the weekly Monday 20:00 scheduled test."""
+def _battery_level_min_near_self_tests(
+    df: pd.DataFrame,
+    self_test_timestamps: List[datetime],
+    tolerance: timedelta = SELF_TEST_WINDOW_TOLERANCE,
+) -> Optional[float]:
+    """Lowest battery level within +/- tolerance of any detected self-test event."""
+    if not self_test_timestamps:
+        return None
     ts = df["timestamp"]
-    test_time = ts.dt.normalize() + pd.Timedelta(hours=SCHEDULED_TEST_HOUR)
-    in_test_window = (ts.dt.weekday == SCHEDULED_TEST_WEEKDAY) & ((ts - test_time).abs() <= SCHEDULED_TEST_TOLERANCE)
-    levels = df.loc[in_test_window, "battery_level"]
+    in_window = pd.Series(False, index=df.index)
+    for test_ts in self_test_timestamps:
+        in_window |= (ts - test_ts).abs() <= tolerance
+    levels = df.loc[in_window, "battery_level"]
     return float(levels.min()) if not levels.empty else None
+
+
+def _time_to_recover(
+    df: pd.DataFrame, start_time: datetime, recovery_threshold_pct: float = BATTERY_RECOVERY_THRESHOLD_PCT
+) -> Optional[float]:
+    """Minutes from start_time until battery_level first reaches recovery_threshold_pct, or None if it never does."""
+    after = df[df["timestamp"] >= start_time]
+    recovered = after[after["battery_level"] >= recovery_threshold_pct]
+    if recovered.empty:
+        return None
+    return float((recovered["timestamp"].iloc[0] - start_time).total_seconds() / 60.0)
+
+
+def _battery_dip_troughs(
+    df: pd.DataFrame, recovery_threshold_pct: float = BATTERY_RECOVERY_THRESHOLD_PCT
+) -> List[datetime]:
+    """Timestamp of the lowest point in each contiguous run where battery_level dips below recovery_threshold_pct."""
+    below = df["battery_level"] < recovery_threshold_pct
+    troughs: List[datetime] = []
+    start_idx = None
+    for i, is_below in enumerate(below):
+        if is_below and start_idx is None:
+            start_idx = i
+        elif not is_below and start_idx is not None:
+            segment = df.iloc[start_idx:i]
+            trough_idx = segment["battery_level"].idxmin()
+            troughs.append(df.at[trough_idx, "timestamp"])
+            start_idx = None
+    return troughs
+
+
+def _longest_deenergize_duration_min(
+    df: pd.DataFrame, recovery_threshold_pct: float = BATTERY_RECOVERY_THRESHOLD_PCT
+) -> Optional[float]:
+    """Longest time from a battery dip's lowest point back up to recovery_threshold_pct, across the window."""
+    durations = [
+        duration
+        for duration in (
+            _time_to_recover(df, trough, recovery_threshold_pct)
+            for trough in _battery_dip_troughs(df, recovery_threshold_pct)
+        )
+        if duration is not None
+    ]
+    return max(durations) if durations else None
 
 
 def summarize_datalog(
     datalog_entries: List["DataLogEntry"],
+    self_test_timestamps: Optional[List[datetime]] = None,
     *,
     temp_threshold_c: float = TEMP_CRITICAL_THRESHOLD_C,
     load_threshold_pct: float = LOAD_OVERLOAD_THRESHOLD_PCT,
@@ -183,8 +323,9 @@ def summarize_datalog(
         load_time_in_overload_min=_duration_above_threshold_min(df, "load_level", load_threshold_pct),
         battery_voltage_min=float(df["battery_voltage"].min()),
         battery_level_net_delta_pct=float(df["battery_level"].iloc[-1] - df["battery_level"].iloc[0]),
-        battery_level_max_discharge_rate_pct_per_hr=_max_discharge_rate_pct_per_hr(df),
-        battery_level_min_scheduled_test_pct=_battery_level_min_scheduled_test(df),
+        min_discharged_value=float(df["battery_level"].min()),
+        longest_deenergize_duration_min=_longest_deenergize_duration_min(df),
+        battery_level_min_scheduled_test_pct=_battery_level_min_near_self_tests(df, self_test_timestamps or []),
     )
 
 
@@ -200,6 +341,55 @@ def compute_rolling_24h(datalog_entries: List["DataLogEntry"]) -> Optional[pd.Da
     return rolling.reset_index()
 
 
+def scheduled_test_windows(
+    self_test_timestamps: List[datetime], tolerance: timedelta = SELF_TEST_WINDOW_TOLERANCE
+) -> List[Tuple[datetime, datetime]]:
+    """Start/end spans around each actual self-test event timestamp, for shading on the rolling graphs."""
+    return [(ts - tolerance, ts + tolerance) for ts in self_test_timestamps]
+
+
+def self_test_timestamps_in_window(
+    eventlog_entries: List["EventLogEntry"], window_start: Optional[datetime]
+) -> List[datetime]:
+    """Timestamps of 'Self Test' executed events (alarm code 47) at/after window_start."""
+    if window_start is None:
+        return []
+    return sorted(
+        e.timestamp
+        for e in eventlog_entries
+        if eventLogCoding.is_self_test_alarm(e.raw_code) and e.timestamp >= window_start
+    )
+
+
+def self_test_recovery_minutes(
+    datalog_entries: List["DataLogEntry"], self_test_timestamps: List[datetime]
+) -> List[Tuple[datetime, Optional[float]]]:
+    """For each self-test event, minutes from its start until battery_level recovers to ~95% (None if it never does)."""
+    df = _datalog_frame(datalog_entries)
+    if df.empty:
+        return [(ts, None) for ts in self_test_timestamps]
+    return [(ts, _time_to_recover(df, ts)) for ts in self_test_timestamps]
+
+
+def analysis_window_start(
+    datalog_entries: List["DataLogEntry"],
+    eventlog_entries: List["EventLogEntry"],
+    window: timedelta = EVENTLOG_ANALYSIS_WINDOW,
+) -> Optional[datetime]:
+    """Start of the trailing `window` used throughout the report for this toolset.
+
+    Anchored to the datalog's own recency (so it reflects actual logged activity, not a gap-skewed
+    'now'); falls back to the eventlog's own recency when there's no datalog data at all. Eventlog
+    filtering uses this instead of its own last-entry timestamp so a toolset whose eventlog has gone
+    quiet (e.g. no new alarms in weeks) doesn't show a stale window as if it were the current one.
+    """
+    df = _datalog_frame(datalog_entries, window)
+    if not df.empty:
+        return df["timestamp"].min()
+    latest_event = _latest_timestamp(eventlog_entries)
+    return (latest_event - window) if latest_event is not None else None
+
+
 def analyze_sdx_logs(
     sdx: str,
     datalog_entries: List["DataLogEntry"],
@@ -212,12 +402,24 @@ def analyze_sdx_logs(
         print(f"Skipping {sdx}: no datalog/eventlog activity in the past {DATALOG_ANALYSIS_WINDOW.days} days.")
         return None
 
+    window_start = analysis_window_start(datalog_entries, eventlog_entries)
+    self_test_timestamps = self_test_timestamps_in_window(eventlog_entries, window_start)
+    self_test_alert = None
+    if not self_test_timestamps:
+        self_test_alert = f"No self-test (alarm code 47) recorded in the trailing {EVENTLOG_ANALYSIS_WINDOW.days} days."
+
+    datalog_summary = summarize_datalog(datalog_entries, self_test_timestamps)
     return SdxAnalysis(
         sdx=sdx,
         sample_count=len(datalog_entries),
         alarm_count=len(eventlog_entries),
-        datalog_summary=summarize_datalog(datalog_entries),
+        datalog_summary=datalog_summary,
         datalog_rolling_24h=compute_rolling_24h(datalog_entries),
+        datalog_gauges=compute_datalog_gauges(datalog_summary),
+        scheduled_test_windows=scheduled_test_windows(self_test_timestamps),
+        self_test_recovery_minutes=self_test_recovery_minutes(datalog_entries, self_test_timestamps),
+        self_test_alert=self_test_alert,
+        analysis_window_start=window_start,
         datalog_entries=datalog_entries,
         eventlog_entries=eventlog_entries,
     )
@@ -226,3 +428,8 @@ def analyze_sdx_logs(
 def write_html_report(analyses: List[SdxAnalysis]) -> Path:
     """Write every processed toolset's analysis into a single combined HTML report."""
     return UPSLogToCsv.write_html_report(analyses)
+
+
+def write_eventlog_raw_csv(analyses: List[SdxAnalysis]) -> Path:
+    """Write every processed toolset's raw (all-severity) eventlog entries into one combined CSV."""
+    return UPSLogToCsv.write_eventlog_raw_csv(analyses)

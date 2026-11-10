@@ -1,0 +1,3 @@
+sdx,timestamp,severity,code,alarm_code
+SDX202,2026-11-02 20:00:02,I,47,'Self Test' executed
+SDX202,2026-11-02 20:00:06,W,1031,Battery Disconnect

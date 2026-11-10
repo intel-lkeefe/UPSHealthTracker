@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import base64
+import csv
 import html
 import io
 import shutil
-from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import matplotlib
 
@@ -19,8 +19,9 @@ if TYPE_CHECKING:
 
     from UPSLogCore import DatalogSummary, SdxAnalysis
 
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Path(__file__).parent / "output"
 REPORT_FILENAME = "ups_health_report.html"
+EVENTLOG_RAW_FILENAME = "ups_eventlog_raw.csv"
 
 
 def clear_output_dir(output_dir: Path = OUTPUT_DIR) -> None:
@@ -33,7 +34,6 @@ def clear_output_dir(output_dir: Path = OUTPUT_DIR) -> None:
             path.unlink()
 
 
-EVENTLOG_ROLLING_WINDOW = timedelta(days=7)
 # "I" (informational) is decoded like the rest but left out of the report, except for the
 # always_include exceptions (self-test results) flagged by UPSLogCore.decode_eventlog_entries.
 EVENTLOG_REPORT_SEVERITIES = {"C", "W"}
@@ -44,11 +44,46 @@ SEVERITY_LABELS = {"C": "Critical", "W": "Warning", "I": "Info"}
 def _eventlog_rows(analysis: "SdxAnalysis") -> list:
     """Warning/critical eventlog entries plus always_include info alarms, from the trailing 7 days, newest first."""
     entries = analysis.eventlog_entries
-    if entries:
-        cutoff = max(e.timestamp for e in entries) - EVENTLOG_ROLLING_WINDOW
-        entries = [e for e in entries if e.timestamp >= cutoff]
+    if analysis.analysis_window_start is not None:
+        entries = [e for e in entries if e.timestamp >= analysis.analysis_window_start]
     entries = [e for e in entries if e.severity in EVENTLOG_REPORT_SEVERITIES or e.always_include]
     return sorted(entries, key=lambda e: e.timestamp, reverse=True)
+
+
+EVENTLOG_RAW_FIELDS = ["sdx", "timestamp", "severity", "code", "alarm_code"]
+
+
+def _as_digit(raw_code: str) -> "int | str":
+    try:
+        return int(raw_code)
+    except (TypeError, ValueError):
+        return raw_code
+
+
+def write_eventlog_raw_csv(analyses: List["SdxAnalysis"], output_dir: Path = OUTPUT_DIR) -> Path:
+    """Dump every toolset's full (all-severity) trailing-7-day eventlog into one combined raw CSV, no message column."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = output_dir / EVENTLOG_RAW_FILENAME
+
+    with raw_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=EVENTLOG_RAW_FIELDS)
+        writer.writeheader()
+        for analysis in sorted(analyses, key=lambda a: a.sdx):
+            entries = analysis.eventlog_entries
+            if analysis.analysis_window_start is not None:
+                entries = [e for e in entries if e.timestamp >= analysis.analysis_window_start]
+            for entry in sorted(entries, key=lambda e: e.timestamp):
+                writer.writerow(
+                    {
+                        "sdx": entry.sdx,
+                        "timestamp": entry.timestamp,
+                        "severity": entry.severity,
+                        "code": _as_digit(entry.raw_code),
+                        "alarm_code": entry.alarm_code,
+                    }
+                )
+
+    return raw_path
 
 
 def _eventlog_table_html(analysis: "SdxAnalysis") -> str:
@@ -93,17 +128,23 @@ DATALOG_SUMMARY_FIELDS = [
     "load_time_in_overload_min",
     "battery_voltage_min",
     "battery_level_net_delta_pct",
-    "battery_level_max_discharge_rate_pct_per_hr",
+    "min_discharged_value",
+    "longest_deenergize_duration_min",
     "battery_level_min_scheduled_test_pct",
 ]
 
 
-def _datalog_summary_table_html(summary: Optional["DatalogSummary"]) -> str:
+def _datalog_summary_table_html(summary: Optional["DatalogSummary"], gauges: Optional[Dict[str, str]] = None) -> str:
     if summary is None:
         return '<p class="empty">No datalog samples in the past 7 days.</p>'
 
+    gauges = gauges or {}
     rows = "\n".join(
-        f"<tr><th>{html.escape(name)}</th><td>{html.escape(str(getattr(summary, name)))}</td></tr>"
+        '<tr><th>{name}</th><td class="{gauge_class}">{value}</td></tr>'.format(
+            name=html.escape(name),
+            gauge_class=f"gauge-{gauges[name]}" if name in gauges else "",
+            value=html.escape(str(getattr(summary, name))),
+        )
         for name in DATALOG_SUMMARY_FIELDS
     )
     return f'<table class="datalog-summary"><tbody>{rows}</tbody></table>'
@@ -120,19 +161,40 @@ ROLLING_GRAPH_PANELS = [
 ]
 
 
-def _rolling_graph_img_html(sdx: str, rolling_24h: Optional["pd.DataFrame"]) -> str:
-    """Render the rolling-24h graph to an in-memory PNG and embed it as a base64 data URI."""
+def _rolling_graph_img_html(
+    sdx: str,
+    rolling_24h: Optional["pd.DataFrame"],
+    test_windows: Optional[List] = None,
+    self_test_recovery: Optional[List] = None,
+) -> str:
+    """Render the rolling-24h graph to an in-memory PNG, shading scheduled self-test windows, as a base64 data URI."""
     if rolling_24h is None:
         return '<p class="empty">No datalog samples to graph.</p>'
 
+    test_windows = test_windows or []
+    self_test_recovery = self_test_recovery or []
     fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharex=True)
     fig.suptitle(f"{sdx} - 7 day Rolling Summary")
 
     for ax, (title, series) in zip(axes.flat, ROLLING_GRAPH_PANELS):
+        for i, (start, end) in enumerate(test_windows):
+            ax.axvspan(start, end, color="orange", alpha=0.25, label="Self-test" if i == 0 else None)
+        trans = ax.get_xaxis_transform()
+        for test_ts, _ in self_test_recovery:
+            ax.text(
+                test_ts,
+                0.98,
+                "Self-test start",
+                transform=trans,
+                rotation=90,
+                va="top",
+                ha="center",
+                fontsize=6,
+                color="darkorange",
+            )
         for column, label in series:
             ax.plot(rolling_24h["timestamp"], rolling_24h[column], label=label)
         ax.set_title(title)
-        ax.legend(loc="best", fontsize="small")
         ax.tick_params(axis="x", rotation=45)
 
     fig.tight_layout(rect=(0, 0, 1, 0.96))
@@ -155,6 +217,10 @@ th, td { border: 1px solid #ccc; padding: 4px 8px; font-size: 0.9rem; text-align
 .sev-C { color: #b00020; font-weight: bold; }
 .sev-W { color: #b36b00; font-weight: bold; }
 .sev-I { color: #1a5fb4; }
+.gauge-green { background: #d4edda; }
+.gauge-yellow { background: #fff3cd; }
+.gauge-red { background: #f8d7da; font-weight: bold; }
+.alert { color: #b00020; font-weight: bold; background: #fdecea; padding: 6px 10px; border-left: 4px solid #b00020; }
 .empty { color: #666; font-style: italic; }
 .rolling-graph { max-width: 100%; height: auto; margin-top: 0.5rem; }
 """
@@ -167,15 +233,17 @@ def write_html_report(analyses: List["SdxAnalysis"], output_dir: Path = OUTPUT_D
 
     sections = []
     for analysis in sorted(analyses, key=lambda a: a.sdx):
+        alert_html = f'<p class="alert">{html.escape(analysis.self_test_alert)}</p>' if analysis.self_test_alert else ""
         sections.append(
             '<section class="toolset">'
             f"<h2>{html.escape(analysis.sdx)}</h2>"
+            f"{alert_html}"
             "<h3>Event Log</h3>"
             f"{_eventlog_table_html(analysis)}"
             "<h3>Datalog Summary</h3>"
-            f"{_datalog_summary_table_html(analysis.datalog_summary)}"
+            f"{_datalog_summary_table_html(analysis.datalog_summary, analysis.datalog_gauges)}"
             "<h3>Rolling 7-Day Graph</h3>"
-            f"{_rolling_graph_img_html(analysis.sdx, analysis.datalog_rolling_24h)}"
+            f"{_rolling_graph_img_html(analysis.sdx, analysis.datalog_rolling_24h, analysis.scheduled_test_windows, analysis.self_test_recovery_minutes)}"
             "</section>"
         )
 
