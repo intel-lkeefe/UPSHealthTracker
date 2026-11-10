@@ -170,6 +170,10 @@ ALARM_CODE_MASK = 0xFFF
 # 0x004 "Self test: OK", 0x02F "'Self Test' executed" (raw codes 0004, 0047).
 INFO_ALARM_REPORT_EXCEPTIONS = {0x004, 0x02F}
 
+# 'Self Test' executed (raw code 47/0047) - marks an actual self-test occurrence, used to detect
+# scheduled/ad-hoc self-tests dynamically instead of assuming a fixed weekly schedule.
+SELF_TEST_ALARM_CODE = 0x02F
+
 
 def decode_alarm_code(code: str | int) -> str:
     """Resolve a raw eventlog alarm code to its alarm description string."""
@@ -217,3 +221,12 @@ def is_reportable_info_alarm(code: str | int) -> bool:
     except (TypeError, ValueError):
         return False
     return (value & ALARM_CODE_MASK) in INFO_ALARM_REPORT_EXCEPTIONS
+
+
+def is_self_test_alarm(code: str | int) -> bool:
+    """True if the raw alarm code is a 'Self Test' executed event (code 47)."""
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return False
+    return (value & ALARM_CODE_MASK) == SELF_TEST_ALARM_CODE
